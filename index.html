@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEXO — Private Messaging</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,sans-serif;background:#fff;color:#202124}
+button,input{font:inherit}
+button{cursor:pointer}
+#app{min-height:100vh}
+.auth{max-width:390px;margin:12vh auto;padding:25px}
+.logo{font-size:30px;font-weight:800;letter-spacing:4px}
+.muted{color:#888;font-size:14px}
+input{width:100%;padding:14px;margin:8px 0;border:1px solid #ddd;border-radius:9px;outline:none}
+input:focus{border-color:#777}
+.btn{padding:13px 18px;border:0;border-radius:9px;background:#171717;color:white}
+.btn:disabled{opacity:.5}
+.secondary{background:#f1f1f1;color:#222}
+.auth button{width:100%;margin-top:10px}
+.error{color:#c33;font-size:13px;margin-top:12px}
+.app{display:flex;height:100dvh;overflow:hidden}
+.sidebar{width:330px;border-right:1px solid #eee;display:flex;flex-direction:column}
+.sidehead{padding:23px;border-bottom:1px solid #eee}
+.brand{font-size:25px;font-weight:800;letter-spacing:3px}
+.members{overflow:auto;flex:1}
+.member{padding:16px 20px;border-bottom:1px solid #f3f3f3;cursor:pointer}
+.member:hover,.member.active{background:#f7f7f7}
+.member strong{display:block;font-size:15px}
+.member small{color:#888}
+.chat{flex:1;display:flex;flex-direction:column;min-width:0}
+.chathead{padding:20px;border-bottom:1px solid #eee;display:flex;align-items:center;gap:12px}
+.chatbody{flex:1;overflow:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:75%;padding:12px 15px;border-radius:13px;background:#f1f1f1;align-self:flex-start;overflow-wrap:anywhere}
+.msg.mine{background:#171717;color:white;align-self:flex-end}
+.msg small{display:block;font-size:10px;opacity:.65;margin-top:7px}
+.composer{display:flex;gap:10px;padding:15px;border-top:1px solid #eee}
+.composer input{margin:0}
+.composer button{white-space:nowrap}
+.empty{margin:auto;text-align:center;color:#999;padding:25px}
+.admin{padding:18px;border-top:1px solid #eee}
+.admin h3{font-size:14px}
+.pending{padding:12px 0;border-bottom:1px solid #eee;font-size:13px}
+.pending button{padding:7px 12px;margin-top:7px}
+.topactions{display:flex;justify-content:space-between;align-items:center}
+.mobileback{display:none}
+@media(max-width:650px){
+.sidebar{width:100%;border:0}
+.chat{display:none;width:100%}
+.app.chatopen .sidebar{display:none}
+.app.chatopen .chat{display:flex}
+.mobileback{display:inline-block}
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="auth">
+    <div class="logo">NEXO</div>
+    <p class="muted">Private conversations. Simple connections.</p>
+    <div id="authform">
+      <input id="name" placeholder="Full name (for signup)" autocomplete="name">
+      <input id="email" type="email" placeholder="Email address">
+      <input id="password" type="password" placeholder="Password">
+      <button class="btn" id="login">Log in</button>
+      <button class="btn secondary" id="signup">Create account</button>
+    </div>
+    <p class="error" id="autherror"></p>
+  </div>
+</div>
+
+<script>
+const SUPABASE_URL = "https://ieuqlsogiqszikbqryol.supabase.co";
+const SUPABASE_KEY = "sb_publishable_SF7hbP_9_GVrN1pw9VIIWA_UjCL_Gxv";
+
+const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const root = document.getElementById("app");
+
+let user = null;
+let profile = null;
+let activeMember = null;
+let activeConversation = null;
+let refreshTimer = null;
+
+const $ = id => document.getElementById(id);
+
+function message(text) {
+  $("autherror").textContent = text;
+}
+
+$("signup").onclick = async () => {
+  const name = $("name").value.trim();
+  const email = $("email").value.trim();
+  const password = $("password").value;
+
+  if (!name || !email || password.length < 6) {
+    message("Enter your name, email and a password of at least 6 characters.");
+    return;
+  }
+
+  $("signup").disabled = true;
+  const {data,error} = await db.auth.signUp({
+    email,password,
+    options:{data:{full_name:name}}
+  });
+  $("signup").disabled = false;
+
+  if(error) return message(error.message);
+
+  if(data.session) {
+    message("Account created. Loading NEXO...");
+  } else {
+    message("Account created. Check your email to confirm your account, then log in.");
+  }
+};
+
+$("login").onclick = async () => {
+  const email = $("email").value.trim();
+  const password = $("password").value;
+
+  if(!email || !password) return message("Enter your email and password.");
+
+  $("login").disabled = true;
+  const {error} = await db.auth.signInWithPassword({email,password});
+  $("login").disabled = false;
+
+  if(error) message(error.message);
+};
+
+function escapeText(value) {
+  return String(value ?? "");
+}
+
+async function start() {
+  const {data:{user:current},error} = await db.auth.getUser();
+  if(error || !current) return showAuth();
+
+  user = current;
+
+  const {data,error:profileError} = await db
+    .from("profiles")
+    .select("*")
+    .eq("id",user.id)
+    .single();
+
+  if(profileError || !data) {
+    showAuth();
+    message("Could not load your profile. Please contact the administrator.");
+    return;
+  }
+
+  profile = data;
+
+  if(!profile.is_approved) {
+    root.innerHTML = `
+      <div class="auth">
+        <div class="logo">NEXO</div>
+        <h2>Approval pending</h2>
+        <p class="muted">Your account is waiting for administrator approval.</p>
+        <button class="btn" id="logout">Log out</button>
+      </div>`;
+    $("logout").onclick = logout;
+    return;
+  }
+
+  renderApp();
+}
+
+function showAuth() {
+  root.innerHTML = `
+    <div class="auth">
+      <div class="logo">NEXO</div>
+      <p class="muted">Private conversations. Simple connections.</p>
+      <div id="authform">
+        <input id="name" placeholder="Full name (for signup)">
+        <input id="email" type="email" placeholder="Email address">
+        <input id="password" type="password" placeholder="Password">
+        <button class="btn" id="login">Log in</button>
+        <button class="btn secondary" id="signup">Create account</button>
+      </div>
+      <p class="error" id="autherror"></p>
+    </div>`;
+  $("signup").onclick = async () => {
+    const name = $("name").value.trim();
+    const email = $("email").value.trim();
+    const password = $("password").value;
+    if(!name || !email || password.length < 6)
+      return message("Enter your name, email and password (minimum 6 characters).");
+    const {data,error} = await db.auth.signUp({
+      email,password,options:{data:{full_name:name}}
+    });
+    if(error) return message(error.message);
+    message(data.session ? "Account created." : "Check your email to confirm your account.");
+  };
+  $("login").onclick = async () => {
+    const {error} = await db.auth.signInWithPassword({
+      email:$("email").value.trim(),
+      password:$("password").value
+    });
+    if(error) message(error.message);
+  };
+}
+
+async function logout() {
+  clearInterval(refreshTimer);
+  await db.auth.signOut();
+  user = null;
+  profile = null;
+  activeMember = null;
+  activeConversation = null;
+  showAuth();
+}
+
+function renderApp() {
+  root.innerHTML = `
+    <div class="app" id="layout">
+      <aside class="sidebar">
+        <div class="sidehead">
+          <div class="topactions">
+            <div class="brand">NEXO</div>
+            <button class="btn secondary" id="logout">Log out</button>
+          </div>
+          <p class="muted">Welcome, ${escapeText(profile.full_name)}</p>
+          <input id="search" placeholder="Search members...">
+        </div>
+        <div class="members" id="members"></div>
+        <div class="admin" id="admin"></div>
+      </aside>
+      <section class="chat">
+        <div class="chathead" id="chathead">
+          <button class="btn secondary mobileback" id="back">Back</button>
+          <strong id="chatname">Select a member</strong>
+        </div>
+        <div class="chatbody" id="chatbody">
+          <div class="empty">Choose a member to start a conversation.</div>
+        </div>
+        <form class="composer" id="composer">
+          <input id="chatinput" placeholder="Write a message..." autocomplete="off" disabled>
+          <button class="btn" id="send" disabled>Send</button>
+        </form>
+      </section>
+    </div>`;
+
+  $("logout").onclick = logout;
+  $("back").onclick = () => $("layout").classList.remove("chatopen");
+  $("composer").onsubmit = sendMessage;
+  $("search").oninput = loadMembers;
+
+  loadMembers();
+  if(profile.is_admin) loadPending();
+
+  clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => {
+    if(activeConversation) loadMessages();
+  },4000);
+}
+
+async function loadMembers() {
+  const {data,error} = await db
+    .from("profiles")
+    .select("id,full_name,is_approved,last_seen")
+    .order("full_name");
+
+  if(error) {
+    $("members").textContent = "Could not load members.";
+    return;
+  }
+
+  const search = $("search").value.toLowerCase();
+  const people = (data || []).filter(p =>
+    p.id !== user.id &&
+    p.is_approved &&
+    (p.full_name || "").toLowerCase().includes(search)
+  );
+
+  $("members").replaceChildren();
+
+  people.forEach(p => {
+    const item = document.createElement("div");
+    item.className = "member" + (activeMember?.id === p.id ? " active" : "");
+    const name = document.createElement("strong");
+    name.textContent = p.full_name || "Member";
+    const info = document.createElement("small");
+    info.textContent = "NEXO member";
+    item.append(name,info);
+    item.onclick = () => openChat(p);
+    $("members").append(item);
+  });
+
+  if(!people.length) {
+    $("members").textContent = "No members found.";
+  }
+}
+
+async function loadPending() {
+  const {data,error} = await db
+    .from("profiles")
+    .select("id,full_name")
+    .eq("is_approved",false)
+    .order("created_at");
+
+  if(error) return;
+
+  $("admin").innerHTML = "<h3>ADMIN · PENDING MEMBERS</h3>";
+
+  (data || []).filter(p => p.id !== user.id).forEach(p => {
+    const row = document.createElement("div");
+    row.className = "pending";
+    const name = document.createElement("div");
+    name.textContent = p.full_name || "New member";
+    const approve = document.createElement("button");
+    approve.className = "btn";
+    approve.textContent = "Approve";
+    approve.onclick = async () => {
+      approve.disabled = true;
+      const {error} = await db.from("profiles")
+        .update({is_approved:true})
+        .eq("id",p.id);
+      if(error) {
+        approve.disabled = false;
+        alert(error.message);
+      } else {
+        row.remove();
+        loadMembers();
+      }
+    };
+    row.append(name,approve);
+    $("admin").append(row);
+  });
+}
+
+async function openChat(member) {
+  activeMember = member;
+  $("layout").classList.add("chatopen");
+  $("chatname").textContent = member.full_name;
+  $("chatinput").disabled = false;
+  $("send").disabled = false;
+  $("chatbody").innerHTML = '<div class="empty">Loading conversation...</div>';
+
+  const ids = [user.id,member.id].sort();
+  const {data:existing,error} = await db.from("conversations")
+    .select("*")
+    .eq("user_one",ids[0])
+    .eq("user_two",ids[1])
+    .maybeSingle();
+
+  if(error) {
+    $("chatbody").textContent = error.message;
+    return;
+  }
+
+  if(existing) {
+    activeConversation = existing.id;
+  } else {
+    const {data,error:createError} = await db.from("conversations")
+      .insert({user_one:ids[0],user_two:ids[1]})
+      .select()
+      .single();
+
+    if(createError) {
+      $("chatbody").textContent = createError.message;
+      return;
+    }
+    activeConversation = data.id;
+  }
+
+  await loadMessages();
+  loadMembers();
+}
+
+async function loadMessages() {
+  if(!activeConversation) return;
+
+  const {data,error} = await db.from("messages")
+    .select("*")
+    .eq("conversation_id",activeConversation)
+    .order("created_at");
+
+  if(error) {
+    $("chatbody").textContent = error.message;
+    return;
+  }
+
+  const body = $("chatbody");
+  body.replaceChildren();
+
+  if(!data.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "Start your conversation.";
+    body.append(empty);
+  }
+
+  data.forEach(m => {
+    const bubble = document.createElement("div");
+    bubble.className = "msg" + (m.sender_id === user.id ? " mine" : "");
+    const content = document.createElement("div");
+    content.textContent = m.content;
+    const meta = document.createElement("small");
+    const time = new Date(m.created_at).toLocaleTimeString([],{
+      hour:"2-digit",minute:"2-digit"
+    });
+    meta.textContent = time + (m.sender_id === user.id ?
+      (m.is_read ? " · Read ✓✓" : " · Sent ✓") : "");
+    bubble.append(content,meta);
+    body.append(bubble);
+  });
+
+  body.scrollTop = body.scrollHeight;
+
+  await db.from("messages")
+    .update({is_read:true})
+    .eq("conversation_id",activeConversation)
+    .neq("sender_id",user.id)
+    .eq("is_read",false);
+}
+
+async function sendMessage(event) {
+  event.preventDefault();
+  if(!activeConversation) return;
+
+  const content = $("chatinput").value.trim();
+  if(!content) return;
+
+  $("send").disabled = true;
+
+  const {error} = await db.from("messages").insert({
+    conversation_id:activeConversation,
+    sender_id:user.id,
+    content
+  });
+
+  $("send").disabled = false;
+
+  if(error) {
+    alert(error.message);
+    return;
+  }
+
+  $("chatinput").value = "";
+  await loadMessages();
+}
+
+db.auth.onAuthStateChange((event,session) => {
+  if(event === "SIGNED_IN" && session) {
+    setTimeout(start,0);
+  }
+  if(event === "SIGNED_OUT") {
+    showAuth();
+  }
+});
+
+start();
+</script>
+</body>
+  </html>
